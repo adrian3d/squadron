@@ -2,13 +2,13 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { run, type Context } from './actions.svelte'
-import { agents, find } from './agents.svelte'
+import { agents, archive, archivable, find } from './agents.svelte'
 import { pointed } from './artifacts.svelte'
 import { ask, message } from './asking.svelte'
 import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
 import { errorText, locale, t } from './i18n/index.svelte'
 import { layout, setPanel } from './layout.svelte'
-import { argsOf, ARGS, catalogOf, EXEC, type Source, grantsOf, itemsOf, load, NET, panelsOf, text, themeOf, toolsOf, updatesOf, type CatalogEntry, type Found, type Item, type Extension, type Panel } from './extensions'
+import { AGENTS, argsOf, ARGS, catalogOf, EXEC, type Source, grantsOf, itemsOf, load, NET, panelsOf, text, themeOf, toolsOf, updatesOf, type CatalogEntry, type Found, type Item, type Extension, type Panel } from './extensions'
 import type { Slot } from './slots'
 import { workdir, type Agent } from './stream'
 import { type as typeInTerminal } from './terminals.svelte'
@@ -28,7 +28,11 @@ export const commandLine = (key: string) =>
       ? t('extensions.network', { host: key.slice(NET.length) })
       : key.startsWith(ARGS)
         ? t('extensions.claudeArgs', { args: (JSON.parse(key.slice(ARGS.length)) as string[]).join(' ') })
-        : key
+        : key === `${AGENTS}read`
+          ? t('extensions.agentsRead')
+          : key === `${AGENTS}archive`
+            ? t('extensions.agentsArchive')
+            : key
 
 export async function loadExtensions() {
   const listing = await invoke<{ extensions: Found[]; disabled: string[]; approved: Record<string, string[]>; sources: string[]; origins: Record<string, string> }>('extensions_list')
@@ -145,7 +149,11 @@ export async function uninstall(extension: Extension) {
   await loadExtensions()
 }
 
-export const asks = (entry: CatalogEntry) => [...(entry.permissions?.exec ?? []).map((p) => commandLine(EXEC + p)), ...(entry.permissions?.network ?? []).map((h) => commandLine(NET + h))]
+export const asks = (entry: CatalogEntry) => [
+  ...(entry.permissions?.exec ?? []).map((p) => commandLine(EXEC + p)),
+  ...(entry.permissions?.network ?? []).map((h) => commandLine(NET + h)),
+  ...(entry.permissions?.agents ?? []).map((a) => commandLine(AGENTS + a)),
+]
 
 const TOLD = 'squadron.extension-updates'
 
@@ -168,6 +176,10 @@ listen<{ extension: string; call: string; [key: string]: unknown }>('extensions-
   if (p.call === 'set-badge' || p.call === 'set-label') {
     const key = `${p.extension}.${p.item}`
     extensions.shown[key] = { ...extensions.shown[key], [p.call === 'set-badge' ? 'badge' : 'label']: (p.value as string | null) ?? null }
+  }
+  if (p.call === 'archive-agent') {
+    const agent = find(String(p.agent))
+    if (agent && archivable(agent)) archive(agent.id)
   }
   if (p.call === 'insert-prompt' && find(String(p.agent))) pointed[String(p.agent)] = [...(pointed[String(p.agent)] ?? []), String(p.text)]
   if (p.call === 'notify' && ((await isPermissionGranted()) || (await requestPermission()) === 'granted')) sendNotification({ title: String(p.title), body: String(p.body) })
@@ -197,6 +209,10 @@ $effect.root(() => {
     if (getCurrentWindow().label !== 'main') return
     const list = extensions.list.filter((m) => m.enabled && m.manifest?.wasm).map((m) => ({ id: m.id, dir: m.dir, wasm: m.manifest!.wasm, allowed: grantsOf(m) }))
     invoke<Record<string, string>>('extensions_wasm_sync', { list }).then((errors) => (extensions.errors = errors))
+  })
+  $effect(() => {
+    if (getCurrentWindow().label !== 'main') return
+    invoke('extensions_set_agents', { list: agents.list.map((agent) => ({ ...info(agent), archivable: archivable(agent) })) })
   })
   $effect(() => {
     if (getCurrentWindow().label !== 'main') return

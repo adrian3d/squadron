@@ -1499,6 +1499,11 @@ fn extensions_wasm_event(
 }
 
 #[tauri::command]
+fn extensions_set_agents(runtime: State<wasm::Runtime>, list: Vec<wasm::Listed>) {
+    runtime.set_agents(list);
+}
+
+#[tauri::command]
 async fn extensions_wasm_run(
     app: AppHandle,
     id: String,
@@ -2339,6 +2344,7 @@ pub fn run() {
             extensions_secret_set,
             extensions_wasm_sync,
             extensions_wasm_event,
+            extensions_set_agents,
             extensions_set_args,
             extensions_wasm_run,
             extensions_wasm_tool,

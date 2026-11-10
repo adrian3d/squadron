@@ -122,7 +122,8 @@ Elles sont déclarées dans le manifeste, montrées à l'installation et accept�
 
 - `exec` : les programmes que le WASM peut lancer, avec n'importe quels arguments, sans shell.
 - `network` : les noms d'hôte que `host::fetch` peut joindre, en HTTPS.
-- `agents:read`, `agents:send`, `cards:write`, `project:read` : l'accès aux données et aux actions de Squadron.
+- `agents` : `read` donne la liste des agents ouverts (`host::agents`), `archive` permet d'archiver un agent (`host::archive-agent`). *Fait en 1.1.0.*
+- `agents:send`, `cards:write`, `project:read` : prévus, pour les autres données et actions de Squadron.
 - `tools` : outils proposés aux agents.
 
 Le sandbox ne protège que ce que l'extension ne peut pas faire. Une commande autorisée tourne avec tous les droits de l'utilisateur. Avec une marketplace, la vraie barrière est l'écran de permissions, et il doit le dire clairement.
@@ -182,6 +183,7 @@ Ce que le manifeste ajoute :
 - l'action `{ "run": "<action>" }` pour un élément : Squadron appelle `run` ;
 - un outil sans `command`, avec un `input` facultatif (schéma JSON de type object) : Squadron appelle `call-tool` avec l'entrée en JSON ;
 - `"permissions": { "exec": ["git"] }` : les programmes que `host::exec` peut lancer, avec n'importe quels arguments, sans shell. La popup d'accord les présente ainsi (« git …, avec n'importe quels arguments »).
+- `"permissions": { "agents": ["read", "archive"] }` : lire la liste des agents ouverts, archiver un agent. La popup d'accord les présente comme les commandes (« Voit la liste de vos agents », « Archive vos agents qui ne travaillent pas »).
 
 Comment ça tourne :
 
@@ -190,12 +192,14 @@ Comment ça tourne :
 - WASI sans fichiers, sans réseau et sans variables d'environnement ;
 - l'état de `state-set` va dans `<config>/extensions-state/<id>.json`, 1 Mo au plus ;
 - une extension qui plante est signalée dans Settings › Extensions et repart sur une instance neuve, en gardant son état ;
-- les événements `agent.done` et `agent.waiting` partent quand l'état d'un agent change.
+- les événements `agent.done` et `agent.waiting` partent quand l'état d'un agent change ;
+- `host::set-timer` envoie l'événement `timer` après un délai de 10 s au moins ; un nouvel appel annule le précédent, et le minuteur ne survit ni au rechargement ni au redémarrage : l'extension le réarme sur `started` ;
+- la fenêtre envoie à Rust la liste des agents ouverts à chaque changement (`extensions_set_agents`), avec un drapeau `archivable` calculé par la règle de l'archivage automatique (`archivable` dans `agents.svelte.ts`) : agent qui ne travaille pas, sans question en attente, ni épinglé, ni distant, ni affiché. `host::archive-agent` refuse les autres, et la fenêtre revérifie avant d'archiver.
 
-Le contrat (`extensions/api/wit/squadron.wit`). On peut lui ajouter des imports sans casser les extensions déjà compilées. Ajouter des exports, en revanche, les casserait : les événements passent donc par un nom et du JSON.
+Le contrat (`extensions/api/wit/squadron.wit`), dont voici l'état en 1.1.0. On peut lui ajouter des imports sans casser les extensions déjà compilées : Wasmtime relie un import `host@1.0.0` à l'hôte `1.1.0`, vérifié en chargeant l'exemple `hello` compilé contre 1.0.0. Une extension qui utilise une fonction 1.1.0 ne se charge pas dans un Squadron plus ancien. Ajouter des exports, en revanche, les casserait : les événements passent donc par un nom et du JSON.
 
 ```wit
-package squadron:api@1.0.0;
+package squadron:api@1.1.0;
 
 interface types {
   /// The agent a call is about.
@@ -230,7 +234,7 @@ interface types {
 }
 
 interface host {
-  use types.{output, request, response};
+  use types.{agent, output, request, response};
 
   /// Writes a line to Squadron's log.
   log: func(message: string);
@@ -251,13 +255,19 @@ interface host {
   fetch: func(request: request) -> result<response, string>;
   /// Sends a JSON message to one of the extension's open panels, which receives it in `squadron.on`.
   panel-post: func(panel: string, message: string);
+  /// The agents open in Squadron, archived ones aside. Needs `agents: ["read"]` in `permissions`. Since 1.1.0.
+  agents: func() -> result<list<agent>, string>;
+  /// Archives an agent, as the user would. Refused while it works, waits for the user, is pinned, remote or shown. Needs `agents: ["archive"]` in `permissions`. Since 1.1.0.
+  archive-agent: func(agent: string) -> result<_, string>;
+  /// Sends the event `timer` in `seconds`, 10 at least, and cancels the one pending. Since 1.1.0.
+  set-timer: func(seconds: u32);
 }
 
 world squadron-extension {
   use types.{agent};
   import host;
 
-  /// Something happened: `started` once the extension is loaded, `agent.done` when an agent finished its turn, `agent.waiting` when it waits for the user, `panel.message` when one of its panels called `squadron.send`, with `{ "panel": "…", "message": … }`. `data` is JSON.
+  /// Something happened: `started` once the extension is loaded, `agent.done` when an agent finished its turn, `agent.waiting` when it waits for the user, `panel.message` when one of its panels called `squadron.send`, with `{ "panel": "…", "message": … }`, `timer` when the delay of `set-timer` is over. `data` is JSON.
   export on-event: func(name: string, agent: option<agent>, data: string);
   /// One of the extension's items with the action `{ "run": "<action>" }` was clicked.
   export run: func(action: string, agent: option<agent>) -> result<_, string>;
