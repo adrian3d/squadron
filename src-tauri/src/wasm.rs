@@ -3,8 +3,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
@@ -14,12 +15,16 @@ wasmtime::component::bindgen!({ path: "../extensions/api/wit", world: "squadron-
 
 use squadron::api::types::{Output, Request, Response};
 
+pub const READ_AGENTS: &str = "agents:read";
+pub const ARCHIVE_AGENTS: &str = "agents:archive";
+
 const FUEL: u64 = 5_000_000_000;
 const MEMORY: usize = 64 << 20;
 const MAX_STATE: usize = 1 << 20;
 const ANSWER: Duration = Duration::from_secs(150);
 const FETCH: Duration = Duration::from_secs(30);
 const MAX_BODY: usize = 8 << 20;
+const MIN_TIMER: u32 = 10;
 
 pub type Emit = Arc<dyn Fn(Value) + Send + Sync>;
 
@@ -43,6 +48,15 @@ impl From<AgentInfo> for Agent {
 }
 
 #[derive(Deserialize, Clone, Debug)]
+pub struct Listed {
+    #[serde(flatten)]
+    pub agent: AgentInfo,
+    pub archivable: bool,
+}
+
+type Agents = Arc<Mutex<Vec<Listed>>>;
+
+#[derive(Deserialize, Clone, Debug)]
 pub struct Spec {
     pub id: String,
     pub dir: String,
@@ -63,7 +77,7 @@ enum Job {
 }
 
 struct Loaded {
-    tx: mpsc::Sender<Job>,
+    tx: Arc<mpsc::Sender<Job>>,
     path: PathBuf,
     modified: Option<SystemTime>,
 }
@@ -77,6 +91,9 @@ struct Host {
     state: BTreeMap<String, String>,
     allowed: Vec<String>,
     emit: Emit,
+    agents: Agents,
+    jobs: Weak<mpsc::Sender<Job>>,
+    timer: Arc<AtomicU64>,
 }
 
 impl WasiView for Host {
@@ -95,6 +112,15 @@ impl Host {
             m.extend(a.clone());
         }
         (self.emit)(message);
+    }
+
+    fn may(&self, permission: &str) -> Result<(), String> {
+        if self.allowed.iter().any(|a| a == permission) {
+            return Ok(());
+        }
+        Err(format!(
+            "{permission} is not allowed. List it in permissions.agents; the user then allows it."
+        ))
     }
 }
 
@@ -186,6 +212,44 @@ impl squadron::api::host::Host for Host {
         fetch(&self.allowed, request, |name| {
             crate::forge::read_secret(&secret_key(&id, name)?)
         })
+    }
+
+    fn agents(&mut self) -> Result<Vec<Agent>, String> {
+        self.may(READ_AGENTS)?;
+        let agents = self.agents.lock().unwrap();
+        Ok(agents.iter().map(|l| l.agent.clone().into()).collect())
+    }
+
+    fn archive_agent(&mut self, agent: String) -> Result<(), String> {
+        self.may(ARCHIVE_AGENTS)?;
+        let mut agents = self.agents.lock().unwrap();
+        let at = agents
+            .iter()
+            .position(|l| l.agent.id == agent)
+            .ok_or_else(|| format!("No open agent has the id {agent}."))?;
+        if !agents[at].archivable {
+            return Err(format!(
+                "{} stays: it works, waits for the user, is pinned, remote or shown.",
+                agents[at].agent.name
+            ));
+        }
+        agents.remove(at);
+        self.tell("archive-agent", json!({"agent": agent}));
+        Ok(())
+    }
+
+    fn set_timer(&mut self, seconds: u32) {
+        let generation = self.timer.fetch_add(1, Ordering::SeqCst) + 1;
+        let (timer, jobs) = (self.timer.clone(), self.jobs.clone());
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(seconds.max(MIN_TIMER).into()));
+            if let Some(jobs) = jobs
+                .upgrade()
+                .filter(|_| timer.load(Ordering::SeqCst) == generation)
+            {
+                let _ = jobs.send(Job::Event("timer".into(), None, "{}".into()));
+            }
+        });
     }
 }
 
@@ -338,6 +402,7 @@ pub struct Runtime {
     loaded: Mutex<HashMap<String, Loaded>>,
     states: PathBuf,
     emit: Emit,
+    agents: Agents,
 }
 
 fn resolve(dir: &str, wasm: &str) -> Result<PathBuf, String> {
@@ -368,7 +433,12 @@ impl Runtime {
             loaded: Default::default(),
             states,
             emit: Arc::new(emit),
+            agents: Default::default(),
         })
+    }
+
+    pub fn set_agents(&self, list: Vec<Listed>) {
+        *self.agents.lock().unwrap() = list;
     }
 
     pub fn sync(&self, specs: Vec<Spec>) -> HashMap<String, String> {
@@ -405,7 +475,7 @@ impl Runtime {
         errors
     }
 
-    fn start(&self, spec: &Spec, path: &Path) -> Result<mpsc::Sender<Job>, String> {
+    fn start(&self, spec: &Spec, path: &Path) -> Result<Arc<mpsc::Sender<Job>>, String> {
         let component = Component::from_file(&self.engine, path).map_err(|e| format!("{e:#}"))?;
         let engine = self.engine.clone();
         let (id, emit, file) = (
@@ -414,6 +484,13 @@ impl Runtime {
             self.states.join(format!("{}.json", spec.id)),
         );
         let mut allowed = spec.allowed.clone();
+        let (tx, rx) = mpsc::channel::<Job>();
+        let tx = Arc::new(tx);
+        let (agents, jobs, timer) = (
+            self.agents.clone(),
+            Arc::downgrade(&tx),
+            Arc::new(AtomicU64::new(0)),
+        );
         let host = move |allowed: &Vec<String>| Host {
             id: id.clone(),
             wasi: WasiCtx::builder().build(),
@@ -426,9 +503,11 @@ impl Runtime {
             file: file.clone(),
             allowed: allowed.clone(),
             emit: emit.clone(),
+            agents: agents.clone(),
+            jobs: jobs.clone(),
+            timer: timer.clone(),
         };
         let (ready_tx, ready_rx) = mpsc::channel();
-        let (tx, rx) = mpsc::channel::<Job>();
         let (report, id) = (self.emit.clone(), spec.id.clone());
         std::thread::spawn(move || {
             let mut current = match instantiate(&engine, &component, host(&allowed)) {
@@ -521,7 +600,7 @@ impl Runtime {
             .lock()
             .unwrap()
             .get(id)
-            .map(|l| l.tx.clone())
+            .map(|l| l.tx.as_ref().clone())
             .ok_or_else(|| format!("The extension {id} is not running."))
     }
 
@@ -665,6 +744,85 @@ mod tests {
             restarted.tool("hello", "clicks", "{}", None).unwrap(),
             "The Count button was clicked 4 times."
         );
+    }
+
+    fn host_with(allowed: &[&str], agents: Agents) -> (Host, Arc<Mutex<Vec<Value>>>) {
+        let told = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let record = told.clone();
+        let host = Host {
+            id: "jira".into(),
+            wasi: WasiCtx::builder().build(),
+            table: ResourceTable::new(),
+            limits: StoreLimitsBuilder::new().build(),
+            file: std::env::temp_dir().join(format!("squadron-wasm-{}.json", uuid::Uuid::new_v4())),
+            state: BTreeMap::new(),
+            allowed: allowed.iter().map(|a| a.to_string()).collect(),
+            emit: Arc::new(move |v| record.lock().unwrap().push(v)),
+            agents,
+            jobs: Weak::new(),
+            timer: Arc::new(AtomicU64::new(0)),
+        };
+        (host, told)
+    }
+
+    fn listed(id: &str, archivable: bool) -> Listed {
+        Listed {
+            agent: AgentInfo {
+                id: id.into(),
+                name: format!("RING-{id}"),
+                project: "/p".into(),
+                dir: "/p".into(),
+            },
+            archivable,
+        }
+    }
+
+    #[test]
+    fn lists_and_archives_agents_only_with_their_permission() {
+        use squadron::api::host::Host as _;
+        let agents: Agents = Arc::new(Mutex::new(vec![listed("1", true), listed("2", false)]));
+
+        let (mut denied, told) = host_with(&["exec:git"], agents.clone());
+        assert!(denied.agents().unwrap_err().contains("agents:read"));
+        assert!(
+            denied
+                .archive_agent("1".into())
+                .unwrap_err()
+                .contains("agents:archive")
+        );
+        assert!(told.lock().unwrap().is_empty());
+
+        let (mut host, told) = host_with(&[READ_AGENTS, ARCHIVE_AGENTS], agents.clone());
+        let names: Vec<_> = host.agents().unwrap().into_iter().map(|a| a.name).collect();
+        assert_eq!(names, ["RING-1", "RING-2"]);
+        assert!(
+            host.archive_agent("2".into())
+                .unwrap_err()
+                .contains("RING-2 stays")
+        );
+        assert!(
+            host.archive_agent("9".into())
+                .unwrap_err()
+                .contains("No open agent")
+        );
+        host.archive_agent("1".into()).unwrap();
+        assert!(host.archive_agent("1".into()).is_err());
+        assert_eq!(host.agents().unwrap().len(), 1);
+        let told = told.lock().unwrap().clone();
+        assert_eq!(
+            told,
+            [json!({"extension": "jira", "call": "archive-agent", "agent": "1"})]
+        );
+    }
+
+    #[test]
+    fn reads_the_agents_the_window_sends() {
+        let list: Vec<Listed> = serde_json::from_str(
+            r#"[{"id":"a","name":"RING-1","project":"/p","dir":"/p/w","archivable":true}]"#,
+        )
+        .unwrap();
+        assert_eq!(list[0].agent.dir, "/p/w");
+        assert!(list[0].archivable);
     }
 
     #[test]
